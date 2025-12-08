@@ -1,0 +1,975 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Mental Rotation Experiment</title>
+
+  <!-- jsPsych core + plugins -->
+  <script src="https://unpkg.com/jspsych@8.2.2"></script>
+  <script src="https://unpkg.com/@jspsych/plugin-preload@2.1.0"></script>
+  <script src="https://unpkg.com/@jspsych/plugin-html-keyboard-response@2.1.0"></script>
+  <script src="https://unpkg.com/@jspsych/plugin-image-keyboard-response@2.1.0"></script>
+  <link href="https://unpkg.com/jspsych@8.2.2/css/jspsych.css" rel="stylesheet" />
+
+  <!-- PapaParse for TSV unparse -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    body {
+      background-color: black;
+      color: white;
+      font-family: Arial, sans-serif;
+    }
+    .jspsych-content {
+      color: white;
+    }
+  </style>
+</head>
+
+<body></body>
+
+<script>
+// ======================================================
+//  Helper: save TSV (design or behaviour)
+// ======================================================
+function save_tsv(dataArray, filename) {
+  const tsv = Papa.unparse(dataArray, { delimiter: "\t" });
+  const blob = new Blob([tsv, "\n"], { type: "text/tab-separated-values;charset=utf-8;" });
+
+  const link = document.createElement("a");
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+}
+
+// ======================================================
+//  Simple seeded RNG (xorshift32)
+// ======================================================
+function makeRNG(seed) {
+  let s = seed >>> 0;
+  function random() {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return (s >>> 0) / 4294967296;
+  }
+  function choice(arr) {
+    if (!arr.length) return undefined;
+    const idx = Math.floor(random() * arr.length);
+    return arr[idx];
+  }
+  function shuffle(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+  function sample(array, k) {
+    if (k > array.length) throw new Error("sample size > population");
+    const a = shuffle(array);
+    return a.slice(0, k);
+  }
+  return { random, choice, shuffle, sample };
+}
+
+// ======================================================
+//  Config + BLOCK/ISI logic
+// ======================================================
+const TARGET_CONFIG = {
+  study_name: 'training',
+  angles: [0, 50, 100, 150],
+  same_mirror_levels: ["same", "mirror"],
+
+  n_objects: 48,                // number of object pairs
+  runs: [1, 2, 3, 4, 5, 6],     // ALL runs for balancing (as in Python)
+
+  stim_dur: 2000,               // per stimulus, ms
+  iti_values: [500],            // ms
+
+  // Presentation scheme
+  simultaneous_isi: 0,                  // ISI used for "simultaneous" condition
+
+  // ISIs used for ordered condition
+  ordered_isi_values: [500, 1500],
+
+  // Repetitions per (angle × same/mirror) combo
+  // -> 4 simultaneous trials
+  // -> 4 ordered trials per ISI
+  sim_reps_per_combo: 4,
+  ordered_reps_per_combo_per_isi: 4,
+
+  // Blocks within each run
+  n_sim_blocks_per_run: 1,
+  n_order_blocks_per_run: 3,
+
+  // Extra delay between blocks (fixation, ms)
+  block_transition_ms: 1000,
+
+  response_dur: 2000,           // ms
+  show_feedback: true,
+  feedback_dur: 500,            // ms
+  rest_dur: 5000,               // rest block duration (ms) [design only currently]
+  n_rest_per_run: 1,            // how many rests per run (design)
+  seed: 42                      // base seed
+};
+
+// ======================================================
+//  Generate targets for one subject & session
+//  Returns: { [runNumber]: [trialRow, ...] }
+// ======================================================
+function generateTargetsForSession(subj_id, ses, cfg) {
+  const angles = cfg.angles;
+  const same_mirror_levels = cfg.same_mirror_levels;
+  const n_objects = cfg.n_objects;
+  const stim_dur = cfg.stim_dur;
+  const iti_values = cfg.iti_values;
+  const response_dur = cfg.response_dur;
+  const show_feedback = cfg.show_feedback;
+  const feedback_dur = cfg.feedback_dur;
+  const rest_dur = cfg.rest_dur;
+  const n_rest_per_run = cfg.n_rest_per_run;
+  const runs = cfg.runs.slice().sort((a,b)=>a-b); // full [1..6]
+
+  const simultaneousISI = (typeof cfg.simultaneous_isi === "number") ? cfg.simultaneous_isi : 0;
+  const orderedISIValues = (cfg.ordered_isi_values && cfg.ordered_isi_values.length > 0)
+    ? cfg.ordered_isi_values.slice()
+    : [500]; // fallback
+
+  const simRepsPerCombo = cfg.sim_reps_per_combo || 4;
+  const orderedRepsPerComboPerISI = cfg.ordered_reps_per_combo_per_isi || 4;
+
+  const nSimBlocks = cfg.n_sim_blocks_per_run || 1;
+  const nOrderBlocks = cfg.n_order_blocks_per_run || orderedISIValues.length || 1;
+
+  const n_runs = runs.length;
+
+  // seed per session
+  const seed = cfg.seed + ses * 1000;
+  const rng = makeRNG(seed);
+
+  // All (angle, same/mirror) combos -> 8 total
+  const combos = [];
+  angles.forEach(a => {
+    same_mirror_levels.forEach(sm => {
+      combos.push({ angle: a, same_mirror: sm });
+    });
+  });
+  if (combos.length !== 8) {
+    console.warn("Expected 8 angle×same/mirror combos, got", combos.length);
+  }
+
+  const chunk_size = n_objects / n_runs;
+  if (Math.round(chunk_size) !== chunk_size) {
+    throw new Error("n_objects must be divisible by number of runs");
+  }
+
+  const per_run_trials = {};
+  runs.forEach(r => { per_run_trials[r] = []; });
+
+  // --------------------------------------------------
+  // First: distribute objects across runs for each combo
+  // --------------------------------------------------
+  combos.forEach(combo => {
+    const angle = combo.angle;
+    const sm = combo.same_mirror;
+
+    let objs = [];
+    for (let i = 1; i <= n_objects; i++) objs.push(i);
+    objs = rng.shuffle(objs);
+
+    runs.forEach((runNumber, idx) => {
+      const start_idx = idx * chunk_size;
+      const end_idx = start_idx + chunk_size;
+      const run_objs = objs.slice(start_idx, end_idx); // 8 objects per combo & run
+
+      run_objs.forEach(obj_id => {
+        per_run_trials[runNumber].push({
+          sn: subj_id,
+          ses: ses,
+          run: runNumber,
+          trial: null,
+          object: obj_id,
+          angle: angle,
+          same_mirror: sm,
+
+          stim_dur_ms: stim_dur,
+          isi_ms: null, // assigned later
+          iti_ms: rng.choice(iti_values),
+
+          response_dur_ms: response_dur,
+          trial_dur_ms: null,
+          start_time: null,
+          end_time: null,
+          has_rest_after: false,
+          rest_after_ms: 0,
+
+          order_1: 1,
+          stim1_name: null,
+          stim2_name: null,
+
+          condition: null,      // simultaneous / ordered
+          block_index: null,    // 1-based within run
+          block_type: null,     // "simultaneous" | "ordered"
+
+          show_feedback: show_feedback,
+          feedback_dur_ms: feedback_dur
+        });
+      });
+    });
+  });
+
+  const designByRun = {};
+
+  runs.forEach(runNumber => {
+    const base_list = per_run_trials[runNumber]; // pool of objects
+    if (base_list.length === 0) {
+      designByRun[runNumber] = [];
+      return;
+    }
+
+    // --------------------------------------------------
+    // Group base_list by (angle, same_mirror)
+    // --------------------------------------------------
+    const groupedByCombo = {};
+    base_list.forEach(row => {
+      const key = `${row.angle}_${row.same_mirror}`;
+      if (!groupedByCombo[key]) groupedByCombo[key] = [];
+      groupedByCombo[key].push(row);
+    });
+
+    // --------------------------------------------------
+    // Build new_raw_list with explicit repetitions:
+    // - 4 sim per combo
+    // - 4 per ISI per combo for ordered
+    // --------------------------------------------------
+    const new_raw_list = [];
+
+    Object.keys(groupedByCombo).forEach(key => {
+      const baseRows = groupedByCombo[key]; // pool of objects (8 per combo)
+
+      // 4 SIMULTANEOUS trials for this combo
+      for (let i = 0; i < simRepsPerCombo; i++) {
+        const base = rng.choice(baseRows);
+        const t = Object.assign({}, base);
+        t.condition = "simultaneous";
+        t.isi_ms = simultaneousISI;
+        new_raw_list.push(t);
+      }
+
+      // 4 ORDERED trials per ISI for this combo
+      orderedISIValues.forEach(isiVal => {
+        for (let i = 0; i < orderedRepsPerComboPerISI; i++) {
+          const base = rng.choice(baseRows);
+          const t = Object.assign({}, base);
+          t.condition = "ordered";
+          t.isi_ms = isiVal;
+          new_raw_list.push(t);
+        }
+      });
+    });
+
+    // Shuffle trial order within run
+    const raw_list = rng.shuffle(new_raw_list);
+    const n_trials = raw_list.length;
+
+    // --------------------------------------------------
+    // Make blocks within run (sim vs ordered)
+    // --------------------------------------------------
+    function makeChunks(indicesArray, nBlocksDesired) {
+      const arr = rng.shuffle(indicesArray.slice());
+      const n = arr.length;
+      if (n === 0 || nBlocksDesired <= 0) return [];
+
+      const nBlocks = Math.min(nBlocksDesired, n);
+      const baseSize = Math.floor(n / nBlocks);
+      let remainder = n - baseSize * nBlocks;
+
+      const chunks = [];
+      let offset = 0;
+      for (let b = 0; b < nBlocks; b++) {
+        let size = baseSize + (remainder > 0 ? 1 : 0);
+        if (remainder > 0) remainder -= 1;
+
+        const chunk = arr.slice(offset, offset + size);
+        chunks.push(chunk);
+        offset += size;
+      }
+      return chunks;
+    }
+
+    const simIndices = [];
+    const orderedIndicesAll = [];
+
+    raw_list.forEach((row, idx) => {
+      if (row.condition === "simultaneous") {
+        simIndices.push(idx);
+      } else {
+        orderedIndicesAll.push(idx);
+      }
+    });
+
+    const simChunks = makeChunks(simIndices, nSimBlocks);
+    const ordChunks = makeChunks(orderedIndicesAll, nOrderBlocks);
+
+    let blocks = [];
+    simChunks.forEach(ch => {
+      blocks.push({
+        type: "simultaneous",
+        indices: rng.shuffle(ch.slice())
+      });
+    });
+    ordChunks.forEach(ch => {
+      blocks.push({
+        type: "ordered",
+        indices: rng.shuffle(ch.slice())
+      });
+    });
+
+    // Randomize block order, but counterbalance which type goes first across runs
+    let blocksShuffled = rng.shuffle(blocks);
+
+    const runIdx = runs.indexOf(runNumber);
+    let desiredFirstType = null;
+    if (simChunks.length > 0 && ordChunks.length > 0 && runIdx !== -1 && n_runs >= 2) {
+      // First half of runs start with simultaneous, second half with ordered
+      desiredFirstType = (runIdx < n_runs / 2) ? "simultaneous" : "ordered";
+    }
+
+    if (desiredFirstType) {
+      const idxFirst = blocksShuffled.findIndex(b => b.type === desiredFirstType);
+      if (idxFirst > 0) {
+        const tmp = blocksShuffled[0];
+        blocksShuffled[0] = blocksShuffled[idxFirst];
+        blocksShuffled[idxFirst] = tmp;
+      }
+    }
+
+    // Assign block indices 1..N in this (now randomized) order
+    let blockCounter = 0;
+    const blocksOrdered = blocksShuffled.map(b => ({
+      type: b.type,
+      indices: b.indices,
+      blockIndex: ++blockCounter
+    }));
+
+    const trialBlockIndex = new Array(n_trials);
+    const trialBlockType = new Array(n_trials);
+
+    blocksOrdered.forEach(block => {
+      block.indices.forEach(idx => {
+        trialBlockIndex[idx] = block.blockIndex;
+        trialBlockType[idx] = block.type;
+      });
+    });
+
+    const trialOrder = [];
+    blocksOrdered.forEach(block => {
+      block.indices.forEach(idx => trialOrder.push(idx));
+    });
+
+    if (trialOrder.length !== n_trials) {
+      throw new Error(
+        `Run ${runNumber}: mismatch between trialOrder length (${trialOrder.length}) and n_trials (${n_trials})`
+      );
+    }
+
+    // -----------------------------
+    // Build run_list with timings, filenames, etc.
+    // -----------------------------
+    const run_list = trialOrder.map(idx => {
+      const base = raw_list[idx];
+      const t = Object.assign({}, base);
+
+      t.block_index = trialBlockIndex[idx];
+      t.block_type = trialBlockType[idx];
+
+      // condition already set; isi_ms already set
+      return t;
+    });
+
+    const max_possible_rests = n_trials - 1;
+    if (n_rest_per_run > max_possible_rests) {
+      throw new Error(
+        "n_rest_per_run=" + n_rest_per_run +
+        " too large for " + n_trials + " trials (max " + max_possible_rests + ")"
+      );
+    }
+
+    const possible_positions = [];
+    for (let t = 1; t <= n_trials - 1; t++) possible_positions.push(t);
+    const rest_positions = rng.sample(possible_positions, n_rest_per_run).sort((a,b)=>a-b);
+
+    let current_time = 0;
+    const finalized = [];
+
+    run_list.forEach((trial, index) => {
+      const t_idx = index + 1;
+
+      trial.trial = t_idx;
+      const isi = trial.isi_ms;
+      const iti = trial.iti_ms;
+      const obj_id = trial.object;
+      const angle = trial.angle;
+      const sm = trial.same_mirror;
+
+      let baseName;
+      if (sm === "mirror") {
+        baseName = `${obj_id}_${angle}_R_obj`;
+      } else {
+        baseName = `${obj_id}_${angle}_obj`;
+      }
+      trial.stim1_name = `${baseName}1.png`;
+      trial.stim2_name = `${baseName}2.png`;
+      trial.order_1 = 1;
+
+      // trial duration for total timeline timing
+      let trial_dur;
+      if (trial.condition === "simultaneous") {
+        trial_dur = stim_dur + response_dur + feedback_dur + iti;
+      } else {
+        trial_dur = 2 * stim_dur + isi + response_dur + feedback_dur + iti;
+      }
+      trial.trial_dur_ms = trial_dur;
+      trial.start_time = current_time;
+      trial.end_time = current_time + trial_dur;
+      current_time += trial_dur;
+
+      if (rest_positions.indexOf(t_idx) !== -1) {
+        trial.has_rest_after = true;
+        trial.rest_after_ms = rest_dur;
+        current_time += rest_dur;
+      } else {
+        trial.has_rest_after = false;
+        trial.rest_after_ms = 0;
+      }
+
+      finalized.push(trial);
+    });
+
+    finalized.sort((a,b) => a.trial - b.trial);
+    designByRun[runNumber] = finalized;
+  });
+
+  return designByRun;
+}
+
+// ======================================================
+//  Main experiment (MULTI-RUN, automatic loop)
+// ======================================================
+async function startExperiment() {
+  try {
+    // --------- AUTO-ASSIGN SUBJECT + FIXED SESSION/RUNS ----------
+    // random 6-digit numeric ID
+    const randomIdNum = Math.floor(Math.random() * 900000) + 100000; // 100000–999999
+    const normSub = randomIdNum.toString().padStart(6, "0");
+    const normSes = "01";
+
+    const subj_id = `sub-${normSub}`;
+    const ses = 1;
+
+    // always run all runs in TARGET_CONFIG.runs
+    const allRuns = TARGET_CONFIG.runs.slice().sort((a,b)=>a-b);
+    const runIds = allRuns;
+
+    console.log("Random subject ID:", subj_id, "(numeric:", randomIdNum, ")");
+    console.log("Session:", ses, "Runs to PRESENT:", runIds);
+    console.log("Design will be generated for ALL runs:", TARGET_CONFIG.runs);
+
+    if (runIds.length === 0) {
+      document.body.innerHTML =
+        "<div style='color:white;padding:20px;'>No valid runs selected.</div>";
+      return;
+    }
+
+    // --------- Generate full design (all 6 runs) ----------
+    const designByRun = generateTargetsForSession(
+      subj_id,
+      ses,
+      TARGET_CONFIG
+    );
+
+    // Build run objects ONLY for requested run(s)
+    const runsTrials = runIds.map(runNum => {
+      const designRows = designByRun[runNum] || [];
+      console.log("Run", runNum, "generated trials:", designRows.length);
+
+      const runIdStr = String(runNum).padStart(2, "0");
+      const mr_trials = designRows.map(row => {
+        const stim1Path = "img/" + row.stim1_name;
+        const stim2Path = "img/" + row.stim2_name;
+        const condRaw = row.condition || "";
+        const condType = condRaw.toLowerCase();
+
+        const sameMirrorStr = (row.same_mirror || "").toString().toLowerCase();
+        const correct_response = sameMirrorStr === "same" ? "f" : "j";
+
+        const sim_html = `
+          <div style="display:flex; justify-content:center; align-items:center; gap:80px;">
+            <img src="${stim1Path}" style="max-height:400px;" />
+            <img src="${stim2Path}" style="max-height:400px;" />
+          </div>
+        `;
+
+        return {
+          stim1: stim1Path,
+          stim2: stim2Path,
+          sim_html: sim_html,
+
+          sn: row.sn,
+          ses: row.ses,
+          run: row.run,
+          trial_index: row.trial,
+          object: row.object,
+          angle: row.angle,
+          same_mirror: row.same_mirror,
+
+          condition_type: condType,
+          condition_raw: condRaw,
+          stim_dur_ms: row.stim_dur_ms,
+          isi_ms: row.isi_ms,
+          iti_ms: row.iti_ms,
+          response_dur_ms: row.response_dur_ms,
+          trial_dur_ms: row.trial_dur_ms,
+          start_time: row.start_time,
+          end_time: row.end_time,
+          has_rest_after: row.has_rest_after,
+          rest_after_ms: row.rest_after_ms,
+          order_1: row.order_1,
+          block_index: row.block_index,
+          block_type: row.block_type,
+          show_feedback: row.show_feedback,
+          feedback_dur_ms: row.feedback_dur_ms,
+
+          correct_response: correct_response,
+          run_label: runIdStr
+        };
+      });
+
+      return { runId: runIdStr, mr_trials };
+    });
+
+    if (runsTrials.length === 0 || runsTrials.every(rt => rt.mr_trials.length === 0)) {
+      document.body.innerHTML =
+        "<div style='color:white;padding:20px;'>No trials generated. Check config.</div>";
+      return;
+    }
+
+    console.log("Example trial object:", runsTrials[0].mr_trials[0]);
+
+    // --------- init jsPsych ----------
+    const jsPsych = initJsPsych({
+      on_finish: function() {
+        console.log("Experiment finished. Total response trials:",
+          jsPsych.data.get().filter({ task: "response" }).count());
+      }
+    });
+
+    const timeline = [];
+
+    // preload images
+    const all_images = runsTrials.flatMap(rt => rt.mr_trials)
+      .flatMap(t => [t.stim1, t.stim2]);
+    console.log("N images to preload:", all_images.length);
+    timeline.push({
+      type: jsPsychPreload,
+      images: all_images
+    });
+
+    // instructions
+    timeline.push({
+      type: jsPsychHtmlKeyboardResponse,
+      stimulus: `
+        <p>Welcome to the mental rotation experiment.</p>
+        <p>On some trials, two objects will appear one after the other (ordered).</p>
+        <p>On other trials, two objects will appear simultaneously side-by-side.</p>
+        <p>Always decide whether the comparison object is the <strong>same</strong>
+           or a <strong>mirror-reversed</strong> version.</p>
+        <p>Press <strong>F</strong> for SAME, <strong>J</strong> for MIRROR.</p>
+        <p>Press any key to begin.</p>
+      `
+    });
+
+    const DEFAULT_S1        = TARGET_CONFIG.stim_dur;
+    const DEFAULT_ISI       = (function() {
+      if (typeof TARGET_CONFIG.simultaneous_isi === "number") return TARGET_CONFIG.simultaneous_isi;
+      if (TARGET_CONFIG.ordered_isi_values && TARGET_CONFIG.ordered_isi_values.length > 0) {
+        return TARGET_CONFIG.ordered_isi_values[0];
+      }
+      if (TARGET_CONFIG.iti_values && TARGET_CONFIG.iti_values.length > 0) {
+        return TARGET_CONFIG.iti_values[0];
+      }
+      return 1000;
+    })();
+    const DEFAULT_ITI       = (TARGET_CONFIG.iti_values && TARGET_CONFIG.iti_values.length > 0)
+      ? TARGET_CONFIG.iti_values[0]
+      : 1000;
+    const DEFAULT_RESPONSE  = TARGET_CONFIG.response_dur;
+    const DEFAULT_FEEDBACK  = TARGET_CONFIG.feedback_dur;
+    const BLOCK_TRANSITION_MS = TARGET_CONFIG.block_transition_ms || 1000;
+
+    const feedback_fixation = {
+      type: jsPsychHtmlKeyboardResponse,
+      choices: "NO_KEYS",
+      trial_duration: function() {
+        const last = jsPsych.data.get().filter({ task: "response" }).last(1).values()[0];
+        if (last && last.feedback_dur_ms != null && !isNaN(last.feedback_dur_ms)) {
+          return last.feedback_dur_ms;
+        }
+        return DEFAULT_FEEDBACK;
+      },
+      data: { task: "feedback" },
+      stimulus: function() {
+        const last = jsPsych.data.get().filter({ task: "response" }).last(1).values()[0];
+        let color = "grey";
+
+        if (last) {
+          if (last.response == null) {
+            color = "grey";
+          } else if (last.correct) {
+            color = "green";
+          } else {
+            color = "red";
+          }
+          if (last.show_feedback === false) {
+            color = "white";
+          }
+        }
+        return `<div style="font-size:60px; color:${color};">+</div>`;
+      }
+    };
+
+    const iti_fixation = {
+      type: jsPsychHtmlKeyboardResponse,
+      stimulus: '<div style="font-size:60px; color:white;">+</div>',
+      choices: "NO_KEYS",
+      trial_duration: function() {
+        const last = jsPsych.data.get().filter({ task: "response" }).last(1).values()[0];
+        if (last && last.iti_ms != null && !isNaN(last.iti_ms)) {
+          return last.iti_ms;
+        }
+        return DEFAULT_ITI;
+      },
+      data: { task: "iti" }
+    };
+
+    // ---------- BUILD TIMELINE (multi-run, multi-block) ----------
+    runsTrials.forEach((runObj, idx) => {
+      const isLastRun = (idx === runsTrials.length - 1);
+
+      // run-level intro
+      timeline.push({
+        type: jsPsychHtmlKeyboardResponse,
+        stimulus: `
+          <p>Run ${idx + 1} of ${runsTrials.length} (run ID ${runObj.runId}).</p>
+          <p>Press any key to start this run.</p>
+        `
+      });
+
+      // group trials by block_index within this run
+      const blocksInRun = {};
+      runObj.mr_trials.forEach(trial => {
+        const bIdx = trial.block_index || 1;
+        if (!blocksInRun[bIdx]) {
+          blocksInRun[bIdx] = {
+            type: trial.block_type || "unknown",
+            trials: []
+          };
+        }
+        blocksInRun[bIdx].trials.push(trial);
+      });
+
+      const blockIdsSorted = Object.keys(blocksInRun)
+        .map(Number)
+        .sort((a,b)=>a-b);
+
+      blockIdsSorted.forEach((blockId, blockIdx) => {
+        const blockInfo = blocksInRun[blockId];
+        const blockType = blockInfo.type || "unknown";
+
+        // block-specific intro
+        timeline.push({
+          type: jsPsychHtmlKeyboardResponse,
+          stimulus: function() {
+            let desc;
+            if (blockType === "simultaneous") {
+              desc = "In this block, the two objects will appear simultaneously side-by-side.";
+            } else if (blockType === "ordered") {
+              desc = "In this block, the two objects will appear sequentially, one after the other.";
+            } else {
+              desc = "In this block, objects will be presented.";
+            }
+            return `
+              <p>${desc}</p>
+              <p>Press any key to start this block.</p>
+            `;
+          },
+          choices: "ALL_KEYS",
+          data: {
+            task: "block_intro",
+            run: runObj.runId,
+            block_index: blockId,
+            block_type: blockType
+          }
+        });
+
+        // trials within this block
+        blockInfo.trials.forEach(trial => {
+          const cond = (trial.condition_type || "").toLowerCase();
+
+          const s1_dur = (trial.stim_dur_ms != null && !isNaN(trial.stim_dur_ms))
+                         ? trial.stim_dur_ms
+                         : DEFAULT_S1;
+          const isi_dur = (trial.isi_ms != null && !isNaN(trial.isi_ms))
+                          ? trial.isi_ms
+                          : DEFAULT_ISI;
+          const resp_dur = (trial.response_dur_ms != null && !isNaN(trial.response_dur_ms))
+                           ? trial.response_dur_ms
+                           : DEFAULT_RESPONSE;
+
+          if (cond.startsWith("sim")) {
+            // SIMULTANEOUS
+            timeline.push({
+              type: jsPsychHtmlKeyboardResponse,
+              stimulus: trial.sim_html,
+              choices: ["f", "j"],
+              stimulus_duration: s1_dur,
+              trial_duration: resp_dur,
+              data: {
+                task: "response",
+                sn: trial.sn,
+                ses: trial.ses,
+                run: trial.run,
+                run_label: trial.run_label,
+                trial_index: trial.trial_index,
+                object: trial.object,
+                angle: trial.angle,
+                same_mirror: trial.same_mirror,
+                condition_type: trial.condition_type,
+                condition_raw: trial.condition_raw,
+                stim_dur_ms: trial.stim_dur_ms,
+                isi_ms: trial.isi_ms,
+                iti_ms: trial.iti_ms,
+                response_dur_ms: trial.response_dur_ms,
+                trial_dur_ms: trial.trial_dur_ms,
+                start_time: trial.start_time,
+                end_time: trial.end_time,
+                has_rest_after: trial.has_rest_after,
+                rest_after_ms: trial.rest_after_ms,
+                order_1: trial.order_1,
+                block_index: trial.block_index,
+                block_type: trial.block_type,
+                show_feedback: trial.show_feedback,
+                feedback_dur_ms: trial.feedback_dur_ms,
+                correct_response: trial.correct_response
+              },
+              on_finish: function(data) {
+                data.correct = jsPsych.pluginAPI.compareKeys(
+                  data.response,
+                  data.correct_response
+                );
+              }
+            });
+
+          } else {
+            // ORDERED
+
+            // S1
+            timeline.push({
+              type: jsPsychImageKeyboardResponse,
+              stimulus: trial.stim1,
+              choices: "NO_KEYS",
+              stimulus_height: 400,
+              trial_duration: s1_dur,
+              data: {
+                task: "s1",
+                sn: trial.sn,
+                ses: trial.ses,
+                run: trial.run,
+                run_label: trial.run_label,
+                trial_index: trial.trial_index,
+                object: trial.object,
+                angle: trial.angle,
+                same_mirror: trial.same_mirror,
+                condition_type: trial.condition_type,
+                condition_raw: trial.condition_raw,
+                block_index: trial.block_index,
+                block_type: trial.block_type
+              }
+            });
+
+            // ISI fixation
+            timeline.push({
+              type: jsPsychHtmlKeyboardResponse,
+              stimulus: '<div style="font-size:60px; color:white;">+</div>',
+              choices: "NO_KEYS",
+              trial_duration: isi_dur,
+              data: {
+                task: "pre_fixation",
+                sn: trial.sn,
+                ses: trial.ses,
+                run: trial.run,
+                run_label: trial.run_label,
+                trial_index: trial.trial_index,
+                block_index: trial.block_index,
+                block_type: trial.block_type
+              }
+            });
+
+            // S2 + response
+            timeline.push({
+              type: jsPsychImageKeyboardResponse,
+              stimulus: trial.stim2,
+              choices: ["f", "j"],
+              stimulus_height: 400,
+              stimulus_duration: s1_dur,
+              trial_duration: resp_dur,
+              data: {
+                task: "response",
+                sn: trial.sn,
+                ses: trial.ses,
+                run: trial.run,
+                run_label: trial.run_label,
+                trial_index: trial.trial_index,
+                object: trial.object,
+                angle: trial.angle,
+                same_mirror: trial.same_mirror,
+                condition_type: trial.condition_type,
+                condition_raw: trial.condition_raw,
+                stim_dur_ms: trial.stim_dur_ms,
+                isi_ms: trial.isi_ms,
+                iti_ms: trial.iti_ms,
+                response_dur_ms: trial.response_dur_ms,
+                trial_dur_ms: trial.trial_dur_ms,
+                start_time: trial.start_time,
+                end_time: trial.end_time,
+                has_rest_after: trial.has_rest_after,
+                rest_after_ms: trial.rest_after_ms,
+                order_1: trial.order_1,
+                block_index: trial.block_index,
+                block_type: trial.block_type,
+                show_feedback: trial.show_feedback,
+                feedback_dur_ms: trial.feedback_dur_ms,
+                correct_response: trial.correct_response
+              },
+              on_finish: function(data) {
+                data.correct = jsPsych.pluginAPI.compareKeys(
+                  data.response,
+                  data.correct_response
+                );
+              }
+            });
+          }
+
+          // feedback + ITI
+          timeline.push(feedback_fixation);
+          timeline.push(iti_fixation);
+        });
+
+        // between-block delay (except after last block in the run)
+        if (blockIdx < blockIdsSorted.length - 1) {
+          timeline.push({
+            type: jsPsychHtmlKeyboardResponse,
+            stimulus: '<div style="font-size:60px; color:white;">+</div>',
+            choices: "NO_KEYS",
+            trial_duration: BLOCK_TRANSITION_MS,
+            data: {
+              task: "between_blocks_fixation",
+              run: runObj.runId,
+              from_block_index: blockId
+            }
+          });
+        }
+      });
+
+      // ----- RUN-SPECIFIC SUMMARY + SAVE + KEY PRESS -----
+      timeline.push({
+        type: jsPsychHtmlKeyboardResponse,
+        stimulus: function() {
+          const trials = jsPsych.data
+            .get()
+            .filter({ task: "response", run_label: runObj.runId });
+
+          const n = trials.count();
+          const correct = trials.filter({ correct: true });
+          const acc = n > 0 ? Math.round((correct.count() / n) * 100) : 0;
+          const rt = Math.round(correct.select("rt").mean());
+
+          return `
+            <p>End of run ${idx + 1} of ${runsTrials.length} (run ID ${runObj.runId}).</p>
+            <p>Accuracy: ${acc}%</p>
+            <p>Reaction time: ${rt} ms</p>
+            <p>Press any key to save data and continue.</p>
+          `;
+        },
+        choices: "ALL_KEYS",
+        on_finish: function() {
+          const runData = jsPsych.data
+            .get()
+            .filter({ task: "response", run_label: runObj.runId })
+            .values();
+
+          const behName = `sub-${normSub}/data/sub-${normSub}_ses-${normSes}_task-mrot_run-${runObj.runId}.tsv`;
+          console.log("Saving behaviour for run", runObj.runId, "N response trials:", runData.length);
+          save_tsv(runData, behName);
+
+          const runNumInt = parseInt(runObj.runId, 10);
+          const designRows = designByRun[runNumInt] || [];
+          const designName = `sub-${normSub}/trials/sub-${normSub}_ses-${normSes}_task-mrot_run-${runObj.runId}.tsv`;
+          console.log("Saving design for run", runObj.runId, "N design rows:", designRows.length);
+          save_tsv(designRows, designName);
+        }
+      });
+
+      // ----- BREAK BETWEEN RUNS (participant-controlled) -----
+      if (!isLastRun) {
+        timeline.push({
+          type: jsPsychHtmlKeyboardResponse,
+          stimulus: `
+            <p>You may now take a short break.</p>
+            <p>Press any key when you are ready to start the next run.</p>
+          `,
+          choices: "ALL_KEYS",
+          data: { task: "break_between_runs" }
+        });
+      }
+    });
+
+    // final debrief across all selected runs
+    timeline.push({
+      type: jsPsychHtmlKeyboardResponse,
+      stimulus: function() {
+        const trials = jsPsych.data.get().filter({ task: "response" });
+        const n = trials.count();
+        const correct = trials.filter({ correct: true });
+        const acc = n > 0 ? Math.round((correct.count() / n) * 100) : 0;
+        const rt = Math.round(correct.select("rt").mean());
+        return `
+          <p>All selected runs are finished.</p>
+          <p>Overall accuracy: ${acc}%</p>
+          <p>Overall mean RT (correct trials): ${rt} ms</p>
+          <p>Press any key to exit.</p>
+        `;
+      }
+    });
+
+    jsPsych.run(timeline);
+
+  } catch (err) {
+    console.error("Experiment failed to start:", err);
+    document.body.innerHTML =
+      "<div style='color:white; padding:20px;'>Experiment failed to load. Open the console for details.</div>";
+  }
+}
+
+// silent startup: black screen, no text
+document.body.style.backgroundColor = "black";
+document.body.innerHTML = "";
+startExperiment();
+</script>
+</html>
