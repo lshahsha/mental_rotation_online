@@ -31,36 +31,31 @@
 <script>
 // ======================================================
 //  Helper: upload TSV (design or behaviour) to server
-//  Replace DATA_UPLOAD_URL with your Apps Script web app URL
+//  Uses form data + no-cors to avoid CORS preflight issues
 // ======================================================
-const DATA_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbyD4htkrYnPxmT1U-JzccADWuhg6fZDP3CykbE5gKk3I7_sWjgoNGTWypqzllVaCU4kcQ/exec"; // TODO: put your URL here
+const DATA_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbyD4htkrYnPxmT1U-JzccADWuhg6fZDP3CykbE5gKk3I7_sWjgoNGTWypqzllVaCU4kcQ/exec";
 
 async function save_tsv(dataArray, filename) {
-  // Convert array-of-objects to TSV string
+  // Turn data into TSV string
   const tsv = Papa.unparse(dataArray, { delimiter: "\t" });
 
-  try {
-    const response = await fetch(DATA_UPLOAD_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        filename: filename,
-        content: tsv
-      })
-    });
+  // Use FormData so Apps Script sees e.parameter.filename / e.parameter.content
+  const formData = new FormData();
+  formData.append('filename', filename);
+  formData.append('content', tsv);
 
-    if (!response.ok) {
-      const text = await response.text();
-      console.error("Upload failed for", filename, response.status, text);
-    } else {
-      console.log("Uploaded", filename, "successfully.");
-    }
+  try {
+    await fetch(DATA_UPLOAD_URL, {
+      method: "POST",
+      mode: "no-cors",   // <- crucial: avoids CORS errors in browser
+      body: formData     // <- no custom headers, so no preflight
+    });
+    console.log("Upload request sent for", filename);
   } catch (err) {
     console.error("Network error while uploading", filename, err);
   }
 }
+
 
 // ======================================================
 //  Simple seeded RNG (xorshift32)
