@@ -31,30 +31,38 @@
 <script>
 // ======================================================
 //  Helper: upload TSV (design or behaviour) to server
-//  Uses form data + no-cors to avoid CORS preflight issues
+//  Uses navigator.sendBeacon (no CORS headaches)
 // ======================================================
-const DATA_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbyD4htkrYnPxmT1U-JzccADWuhg6fZDP3CykbE5gKk3I7_sWjgoNGTWypqzllVaCU4kcQ/exec";
+const DATA_UPLOAD_URL = "https://script.google.com/macros/s/AKfycbz0jcrGQrDBgB5rFT3iovPpaHms-Nhs4ezcMkpOetOvi95Y7i8Rt99IJaqXz3W-K5u-2Q/exec";
 
 async function save_tsv(dataArray, filename) {
-  // Turn data into TSV string
+  // Convert array-of-objects to TSV string
   const tsv = Papa.unparse(dataArray, { delimiter: "\t" });
 
-  // Use FormData so Apps Script sees e.parameter.filename / e.parameter.content
-  const formData = new FormData();
-  formData.append('filename', filename);
-  formData.append('content', tsv);
+  // Build URL with ?filename=... so Apps Script sees e.parameter.filename
+  const url = DATA_UPLOAD_URL + "?filename=" + encodeURIComponent(filename);
 
+  // Preferred path: navigator.sendBeacon (no CORS, fire-and-forget)
+  if (navigator.sendBeacon) {
+    const blob = new Blob([tsv], { type: "text/plain;charset=utf-8" });
+    const ok = navigator.sendBeacon(url, blob);
+    console.log("sendBeacon result for", filename, ok);
+    return;
+  }
+
+  // Fallback: simple POST, no custom headers, no-cors
   try {
-    await fetch(DATA_UPLOAD_URL, {
+    await fetch(url, {
       method: "POST",
-      mode: "no-cors",   // <- crucial: avoids CORS errors in browser
-      body: formData     // <- no custom headers, so no preflight
+      mode: "no-cors",
+      body: tsv   // text/plain; simple request, no preflight
     });
-    console.log("Upload request sent for", filename);
+    console.log("Fallback fetch sent for", filename);
   } catch (err) {
-    console.error("Network error while uploading", filename, err);
+    console.error("Upload error for", filename, err);
   }
 }
+
 
 
 // ======================================================
